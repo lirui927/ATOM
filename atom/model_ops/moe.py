@@ -231,7 +231,7 @@ def pad_for_all_gather(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
     padding_shape[0] = max_batch_size
     padded_x = torch.empty(padding_shape, device=x.device, dtype=x.dtype)
     padded_x[:original_batch_size, :].copy_(x)
-    padded_x[original_batch_size:, :].zero_()
+    # padded_x[original_batch_size:, :].zero_()
     return padded_x, original_batch_size
 
 
@@ -2797,7 +2797,7 @@ class FusedMoE(torch.nn.Module):
                 load_size = loaded_weight.shape[shard_dim]
                 if load_size != expert_data.shape[shard_dim]:
                     expert_data = expert_data.narrow(shard_dim, 0, load_size)
-                expert_data.copy_(loaded_weight)
+                self._copy_quant_storage(expert_data, loaded_weight)
             elif shard_id in ("w1", "w3"):
                 self._load_w13(
                     shard_id=shard_id,
@@ -2809,7 +2809,7 @@ class FusedMoE(torch.nn.Module):
                 )
             return
         if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            self._copy_quant_storage(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -2833,9 +2833,9 @@ class FusedMoE(torch.nn.Module):
             dtypes.fp8_e8m0,
         )
         if dst.dtype in fp8_storage_dtypes and src.dtype in fp8_storage_dtypes:
-            # Offline FP8 checkpoints encode e4m3 bits. If the destination was
-            # allocated as platform fp8 (often fnuz), Tensor.copy_ converts the
-            # values before the later fn->fnuz scale fixup. Preserve the bytes.
+            # Offline FP8 checkpoints encode raw FP8 bytes. Avoid dtype-to-dtype
+            # numeric conversion when destination storage uses a different FP8
+            # variant; later scale fixups expect the original bytes.
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
             return
         if dst.dtype == dtypes.fp8_e8m0 and src.dtype == torch.uint8:
