@@ -1427,6 +1427,13 @@ def minimax_m3_sparse_attn_decode_asm(
     )
 
 
+@functools.cache
+def _cluster_resident_rows(device) -> int:
+    """Rows (one KV head each) whose clusters of eight all stay resident at
+    once: gfx1250 keeps 15 clusters per 16 CUs."""
+    return torch.cuda.get_device_properties(device).multi_processor_count * 15 // 16
+
+
 @torch.no_grad()
 def sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
@@ -1498,14 +1505,23 @@ def sparse_pa_per_row(
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
-    if quantized_output is not None and max_context_partition_num != 8 and not decode:
-        # aiter fuses the FP8 epilogue into its direct (one partition) and
-        # eight-CTA cluster merges only; any other split quantizes after the
-        # merge, in a launch of its own. A prefill row's causal window is short,
-        # so one CTA per token fills the device as well and takes the direct
-        # kernel. A decode row attends a whole top-k window: one CTA each leaves
-        # CUs idle (128 rows: 20.1 us direct vs 13.2 us cluster4 per layer), so
-        # decode keeps its split.
+    plan_workgroup_budget = None
+    # aiter fuses the FP8 epilogue into its direct (one partition) and eight-CTA
+    # cluster merges only; any other split quantizes after the merge, in a
+    # launch of its own.
+    if quantized_output is not None and decode:
+        # A decode row attends a whole top-k window, so one CTA each leaves CUs
+        # idle (128 rows: 20.1 us direct vs 13.2 us cluster4 per layer). Give
+        # each row one cluster of eight instead, while they all stay resident:
+        # past 64 rows the default budget (two workgroups per CU) holds fewer
+        # than eight tasks per row, or not 65..73 rows' clusters. Up to 64 rows
+        # this is the plan they already had; past the limit the split stays.
+        if num_seqs <= _cluster_resident_rows(q.device):
+            max_context_partition_num = 8
+            plan_workgroup_budget = 8 * num_seqs
+    elif quantized_output is not None and max_context_partition_num != 8:
+        # A prefill row's causal window is short: one CTA per token fills the
+        # device as well and takes the direct kernel.
         max_context_partition_num = 1
     context_partition_size = 256
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
@@ -1543,6 +1559,7 @@ def sparse_pa_per_row(
         plan_cache_owner=plan_cache_owner,
         # Bounded topk window per row: keep the static split cap.
         plan_partition_cap=max_context_partition_num,
+        plan_workgroup_budget=plan_workgroup_budget,
     )
 
 

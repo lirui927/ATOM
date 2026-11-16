@@ -124,7 +124,9 @@ def test_only_atom_sparse_mha_outside_sp_quantizes_its_output():
     [
         (False, 4, 5, 1, None),  # prefill rows: one CTA each, the fused direct kernel
         (False, 8, 5, 8, None),  # eight splits: the fused cluster8 merge
-        (True, 4, 128, 4, None),  # decode rows keep their split
+        (True, 4, 128, 8, 8 * 128),  # decode rows: one resident cluster of eight
+        (True, 8, 72, 8, 8 * 72),  # eight splits, but not the default's clusters
+        (True, 4, 241, 4, None),  # past the resident clusters: the split stays
     ],
 )
 def test_sparse_rows_pick_a_split_the_fp8_epilogue_serves(
@@ -137,6 +139,7 @@ def test_sparse_rows_pick_a_split_the_fp8_epilogue_serves(
         lambda *_: splits,
     )
     monkeypatch.setattr(sparse_attn, "_sparse_pa_ran_on_asm", pytest.fail)
+    monkeypatch.setattr(sparse_attn, "_cluster_resident_rows", lambda _: 240)
     bucket = rows + 3  # a padded batch: the PA writes the last three inert
     q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
     fp8 = torch.empty((bucket, 16, 128), dtype=torch.uint8)
