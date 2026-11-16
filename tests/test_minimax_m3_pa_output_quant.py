@@ -238,3 +238,27 @@ def test_fp8_output_dequantizes_to_attention(monkeypatch, decode, rows):
     amax = ref.abs().amax(dim=(1, 2), keepdim=True)
     assert ((got - ref).abs() <= amax / 10).all()  # + half an e4m3 step, amax / 28
     assert (fp8[rows:].float() == 0).all() and (scale[rows:] == 1).all()
+
+
+def test_a_padded_token_graph_prefill_attends_its_scheduled_rows(monkeypatch):
+    """The quant op hands the impl the scheduled rows and the bucket's whole FP8
+    output, whose rows past them the PA writes inert (`quantized_pad_rows`)."""
+    from atom.utils import forward_context
+
+    seen = {}
+    layer = SimpleNamespace(impl=SimpleNamespace(forward=lambda **kw: seen.update(kw)))
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={"attn": layer})
+    )
+    monkeypatch.setattr(base_attention, "get_current_atom_config", lambda: config)
+    step = SimpleNamespace(is_prefill=True, scheduled_tokens=5)
+    monkeypatch.setattr(
+        forward_context, "_forward_context", SimpleNamespace(context=step)
+    )
+    q, fp8, scale = torch.ones(8, 4), torch.empty(8, 4), torch.empty(8, 1)
+    base_attention.unified_attention_with_output_quant_base.__wrapped__(
+        q, q, q, torch.arange(8), "attn", q, fp8, scale
+    )
+    assert [seen[n].shape[0] for n in ("query", "key", "value", "qkv")] == [5] * 4
+    assert seen["position"].shape == (5,)
+    assert seen["quantized_output"] is fp8 and seen["output_scale"] is scale

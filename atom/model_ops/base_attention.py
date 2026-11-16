@@ -1165,6 +1165,13 @@ def unified_attention_with_output_quant_base(
     the caller's ``quantized_output`` / ``output_scale``."""
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
+    rows = padded_prefill_rows(q.shape[0])
+    if rows is not None:
+        # A prefill padded to a token-graph bucket attends its scheduled rows;
+        # the PA writes the bucket's rows past them, which o_proj reads, as FP8
+        # zeros with a unit descale.
+        q, k, v, qkv = (t if t is None else t[:rows] for t in (q, k, v, qkv))
+        positions = positions[..., :rows]
     self.impl.forward(
         query=q,
         key=k,
