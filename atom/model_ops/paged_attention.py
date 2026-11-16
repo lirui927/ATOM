@@ -4,6 +4,7 @@
 # from flash_attn import flash_attn_with_kvcache
 
 import torch
+from aiter import dtypes
 from aiter.dist.parallel_state import get_pcp_group
 from torch import nn
 
@@ -166,3 +167,40 @@ class Attention(BaseAttention):
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )
         return output
+
+    @property
+    def quantizes_output(self) -> bool:
+        """Whether `forward_quantized` serves this layer: its impl writes FP8
+        output (`supports_output_quant`), and not under MLA or Ulysses SP, whose
+        inputs and head exchange only `forward` handles."""
+        return (
+            not self.use_mla
+            and self.sp_columns is None
+            and getattr(self.impl, "supports_output_quant", False)
+        )
+
+    def forward_quantized(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor = None,
+        qkv: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`forward`'s output as OCP FP8 rows and their FP32 ``[tokens, 1]``
+        descales, written by the attention kernel (`quantizes_output`)."""
+        if not self.quantizes_output:
+            raise RuntimeError(f"{self.layer_name} cannot quantize its output")
+        quantized_output = torch.empty_like(query, dtype=dtypes.fp8)
+        output_scale = query.new_empty((query.shape[0], 1), dtype=torch.float32)
+        torch.ops.aiter.unified_attention_with_output_quant_base(
+            query,
+            key,
+            value,
+            positions,
+            self.layer_name,
+            qkv,
+            quantized_output,
+            output_scale,
+        )
+        return quantized_output, output_scale

@@ -213,6 +213,37 @@ def _flydsl_arch_supported() -> bool:
     return get_gfx_runtime() in _FLYDSL_PA_ARCHS
 
 
+@functools.lru_cache(maxsize=1)
+def _flydsl_output_quant_api() -> bool:
+    """Whether aiter's FlyDSL ``pa_decode`` can write the gfx1250 sparse PA's
+    output as OCP FP8 plus per-token FP32 descales (ROCm/aiter#7401):
+    ``quantized_output`` / ``output_scale``, ``store_output`` (skip the BF16
+    store) and ``quantized_pad_rows`` (rows past the queries written as FP8
+    zeros with a unit descale). Without them the sparse PA keeps its BF16
+    output and o_proj quantizes it."""
+    import importlib
+    import inspect
+
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        return False
+    try:
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    except ImportError:
+        return False
+    params = inspect.signature(mod.pa_decode).parameters
+    return all(
+        name in params
+        for name in (
+            "quantized_output",
+            "output_scale",
+            "store_output",
+            "quantized_pad_rows",
+        )
+    )
+
+
 def _flydsl_pa_decode_num_seqs(
     *,
     output: torch.Tensor,
@@ -593,6 +624,8 @@ def run_pa_decode(
     exp_sums: torch.Tensor | None = None,
     max_logits: torch.Tensor | None = None,
     temporary_output: torch.Tensor | None = None,
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
@@ -617,7 +650,15 @@ def run_pa_decode(
     ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
     Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
     call, which uses its plan's cached scratch, allocates none.
+
+    ``quantized_output`` / ``output_scale``: a FlyDSL-only output in place of
+    ``output`` (`_flydsl_output_quant_api`), OCP FP8 in the attention layout
+    plus contiguous FP32 ``[rows, 1]`` descales. ``output`` then only gives the
+    layout and is not written; rows of the pair past ``q``'s are written as
+    FP8 zeros with a unit descale.
     """
+    if (quantized_output is None) != (output_scale is None):
+        raise ValueError("quantized_output and output_scale go together")
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
         q=q,
@@ -729,6 +770,14 @@ def run_pa_decode(
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
+        quant = {}
+        if quantized_output is not None:
+            quant = {
+                "quantized_output": quantized_output,
+                "output_scale": output_scale,
+                "store_output": False,
+                "quantized_pad_rows": quantized_output.shape[0] - q.shape[0],
+            }
         return _flydsl_pa_decode(
             output,
             q,
@@ -751,8 +800,11 @@ def run_pa_decode(
             sliding_window=0,
             work_plan=work_plan,
             max_context_length=context_bound,
+            **quant,
         )
 
+    if quantized_output is not None:
+        raise RuntimeError("only FlyDSL's paged decode writes a quantized output")
     if not pa_decode_gluon_supports_arch():
         raise RuntimeError(
             "This GPU has no gluon paged decode: set ATOM_PA_FLYDSL=1"
@@ -1040,6 +1092,51 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+
+
+def unified_attention_with_output_quant_base_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    return None
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=unified_attention_with_output_quant_base_fake,
+    mutates_args=["quantized_output", "output_scale"],
+)
+@eager_region()
+def unified_attention_with_output_quant_base(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    """`unified_attention_with_output_base` for a layer whose impl writes its
+    output as FP8 plus per-token descales (`Attention.forward_quantized`), into
+    the caller's ``quantized_output`` / ``output_scale``."""
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    self.impl.forward(
+        query=q,
+        key=k,
+        value=v,
+        position=positions,
+        qkv=qkv,
+        quantized_output=quantized_output,
+        output_scale=output_scale,
+    )
 
 
 def linear_attention_with_output_base_fake(
