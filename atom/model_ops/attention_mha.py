@@ -229,12 +229,18 @@ class PagedAttentionImpl(nn.Module):
         position: torch.Tensor = None,
         q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
+        quantized_output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ):
 
         fwd_ctx: ForwardContext = get_forward_context()
 
         # dummy run will skip attention in cuda graph capture phase
         if fwd_ctx.context.is_dummy_run:
+            if quantized_output is not None:
+                quantized_output.zero_()
+                output_scale.fill_(1.0)
+                return quantized_output
             o = torch.empty_like(q)
             return o
 
@@ -249,7 +255,17 @@ class PagedAttentionImpl(nn.Module):
         )
 
         attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
-        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        # The FP8 output (`unified_attention_with_output_quant_base`): only the
+        # sparse MHA backends take it.
+        quant = {}
+        if quantized_output is not None:
+            quant = {
+                "quantized_output": quantized_output.view(
+                    -1, self.num_heads, self.head_dim
+                ),
+                "output_scale": output_scale,
+            }
+        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx, **quant)
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
@@ -1204,6 +1220,8 @@ class PagedAttentionImpl(nn.Module):
         q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         output: torch.Tensor = None,
+        quantized_output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
         **kwargs,
     ):
         return self.forward_impl(
@@ -1213,6 +1231,8 @@ class PagedAttentionImpl(nn.Module):
             position=position,
             q_scale=q_scale,
             qkv=qkv,
+            quantized_output=quantized_output,
+            output_scale=output_scale,
         )
 
 
@@ -1244,6 +1264,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """
 
     is_indexed_sparse_attention = True
+
+    @property
+    def supports_output_quant(self) -> bool:
+        """Whether the sparse PA can hand o_proj FP8 rows and per-token descales
+        (`unified_attention_with_output_quant_base`): not over the MXFP4 KV cache,
+        whose PA (`_sparse_pa_mxfp4`) has no such output."""
+        return self.kv_cache_dtype != "fp4"
 
     @staticmethod
     def qkv_fields(
@@ -1678,7 +1705,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        quantized_output=None,
+        output_scale=None,
     ):
         from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk
         from atom.model_ops.minimax_m3.sparse_attn import (
@@ -1741,10 +1778,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        # one output, its rows past the metadata's zero, written in place (as decode)
+        # one output, its rows past the metadata's zero, written in place (as decode);
+        # with the FP8 one the PA writes those rows of it inert and no BF16 at all
         fp4_kv = self.kv_cache_dtype == "fp4"
         output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
-        if rows < q.shape[0]:
+        if rows < q.shape[0] and quantized_output is None:
             output[rows:].zero_()
         if fp4_kv:
             # plan-free: a prefill chunk's row count is new almost every forward
@@ -1772,6 +1810,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 output[:rows],
+                quantized_output=quantized_output,
+                output_scale=output_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 cu_seqlens_q=cu_seqlens_q,
@@ -1781,6 +1821,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
                 plan_cache_owner=prefill_md,
             )
+        if quantized_output is not None:
+            output = quantized_output
         output = output.view(*q.shape)
         self._index_q = None
         self._index_q_cache_key_info = None
@@ -1875,7 +1917,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        quantized_output=None,
+        output_scale=None,
     ):
         from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
         from atom.model_ops.minimax_m3.sparse_attn import (
@@ -1936,10 +1988,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
         # one output, its pad rows (past the metadata's) zero, written in place; the
-        # MXFP4 KV's q is e4m3, so its output takes the value dtype instead
+        # MXFP4 KV's q is e4m3, so its output takes the value dtype instead. With
+        # the FP8 output the PA writes those rows of it inert and no BF16 at all.
         fp4_kv = self.kv_cache_dtype == "fp4"
         output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
-        if rows < q.shape[0]:
+        if rows < q.shape[0] and quantized_output is None:
             output[rows:].zero_()
         if fp4_kv:
             self._sparse_pa_mxfp4(
@@ -1966,6 +2019,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 output[:rows],
+                quantized_output=quantized_output,
+                output_scale=output_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 sparse_bt=sparse_bt,
@@ -1975,5 +2030,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         self._index_q = None
         self._index_q_cache_key_info = None
+        if quantized_output is not None:
+            output = quantized_output
         output = output.view(*q.shape)
         return output

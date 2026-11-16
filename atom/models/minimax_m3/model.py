@@ -25,6 +25,7 @@ from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
     Attention,
     _flydsl_arch_supported,
+    _flydsl_output_quant_api,
     _flydsl_plan_max_batch,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -595,6 +596,19 @@ class MiniMaxM3SparseAttention(nn.Module):
             per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
             == (QuantType.per_Token, dtypes.fp8),
         )
+        # Whether the sparse PA can write o_proj's per-token FP8 input itself
+        # (aiter's FlyDSL decode, GQA16, head_dim 128, one KV head; ATOM's own
+        # Attention, not a plugin's). Whether o_proj takes per-token FP8 is known
+        # only once online quantization has re-quantized it at load, so
+        # `forward` checks that part.
+        self.sparse_pa_output_quant = (
+            envs.ATOM_PA_FLYDSL
+            and self.num_kv_heads == 1
+            and self.num_heads == 16
+            and self.head_dim == 128
+            and getattr(self.attn, "quantizes_output", False)
+            and _flydsl_output_quant_api()
+        )
 
     def forward(
         self,
@@ -615,6 +629,11 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
+        if self.sparse_pa_output_quant and _linear_consumes_per_token_fp8(self.o_proj):
+            attn_output, attn_scale = self.attn.forward_quantized(
+                q, k, v, positions, qkv=qkv
+            )
+            return self.o_proj(attn_output, x_scale=attn_scale)
         attn_output = self.attn(q, k, v, positions, qkv=qkv)
         if isinstance(attn_output, tuple):
             return self.o_proj(*attn_output)
