@@ -550,6 +550,31 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         return built
 
+    @property
+    def supports_token_graph(self) -> bool:
+        """Every launch outside the model's eager regions -- the KDA recurrence
+        and MLA attention -- is sized by the token count alone, so a prefill
+        may pad to a recorded token-graph bucket; the regions run its scheduled
+        rows (`region_graph.padded_prefill_rows`).
+
+        Not under DP: a decoding or idle rank would replay the prefill
+        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
+        prefill alone. Nor while an MLA layer the model records cannot take
+        the prefill split (`MLAAttention.prefill_split_supported`: a sparse
+        layer, PCP, ``ATOM_USE_TRITON_GEMM``): its whole-layer region would cut
+        the step's rows out of an FP8 q scale whose bytes are column-major. A
+        drafter's layers do not count; the recording runs the target alone."""
+        config = self.model_runner.config
+        if config.parallel_config.data_parallel_size != 1:
+            return False
+        sfc = config.compilation_config.static_forward_context
+        return all(
+            impl.prefill_split_supported()
+            for module in sfc.values()
+            if isinstance(impl := getattr(module, "impl", None), MLAAttention)
+            and impl.split_prefill_recording
+        )
+
     def _stage_draft_ctx_slots(
         self, batch, seqlens_q: np.ndarray, rows: int, group
     ) -> None:
